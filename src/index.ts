@@ -21,6 +21,7 @@ export interface ReqlensLog {
 }
 
 export type ReqlensBodyCaptureMode = "always" | "errors-only" | "off";
+export type ReqlensLogLevel = "info" | "silent";
 
 export interface ReqlensCaptureOptions {
   requestBody?: ReqlensBodyCaptureMode;
@@ -41,6 +42,7 @@ export interface ReqlensOptions {
   maxQueueSize?: number;
   requestTimeoutMs?: number;
   enabled?: boolean;
+  logLevel?: ReqlensLogLevel;
   capture?: ReqlensCaptureOptions;
   onError?: (error: unknown) => void;
 }
@@ -56,6 +58,7 @@ interface NormalizedOptions {
   maxQueueSize: number;
   requestTimeoutMs: number;
   enabled: boolean;
+  logLevel: ReqlensLogLevel;
   capture: Required<ReqlensCaptureOptions>;
   onError?: (error: unknown) => void;
 }
@@ -90,6 +93,10 @@ export function reqlens(options: ReqlensOptions): RequestHandler {
       slowRequestThresholdMs > 0
     ) {
       config.capture.slowRequestThresholdMs = Math.floor(slowRequestThresholdMs);
+      logInfo(
+        config,
+        `Config loaded. Slow payload capture threshold: ${config.capture.slowRequestThresholdMs} ms.`
+      );
     }
   };
 
@@ -126,6 +133,7 @@ export function reqlens(options: ReqlensOptions): RequestHandler {
   interval.unref?.();
   void syncConfig();
   void streamConfig(config, applyConfig);
+  logInfo(config, "Middleware started. Request logs will appear in the Reqlens dashboard.");
 
   return (req, res, next) => {
     if (!config.enabled) {
@@ -202,6 +210,7 @@ function normalizeOptions(options: ReqlensOptions): NormalizedOptions {
     maxQueueSize: positiveInt(options.maxQueueSize, DEFAULT_MAX_QUEUE_SIZE),
     requestTimeoutMs: positiveInt(options.requestTimeoutMs, DEFAULT_REQUEST_TIMEOUT_MS),
     enabled: options.enabled ?? true,
+    logLevel: options.logLevel ?? "info",
     capture: {
       maxBodyBytes: positiveInt(
         options.capture?.maxBodyBytes,
@@ -323,6 +332,7 @@ async function streamConfig(
         throw new Error("Reqlens config stream response had no body.");
       }
 
+      logInfo(config, "Connected to Reqlens config stream.");
       await readConfigStream(response.body, applyConfig);
     } catch (error) {
       config.onError?.(error);
@@ -518,4 +528,12 @@ function safeStringify(value: unknown): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+function logInfo(config: NormalizedOptions, message: string): void {
+  if (config.logLevel === "silent") {
+    return;
+  }
+
+  console.info(`[reqlens] ${message}`);
 }
