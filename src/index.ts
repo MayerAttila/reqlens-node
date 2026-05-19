@@ -33,6 +33,9 @@ export interface ReqlensCaptureOptions {
 export interface ReqlensOptions {
   apiKey: string;
   endpoint: string;
+  configEndpoint?: string;
+  configStreamEndpoint?: string;
+  configReconnectDelayMs?: number;
   batchSize?: number;
   flushIntervalMs?: number;
   maxQueueSize?: number;
@@ -45,6 +48,9 @@ export interface ReqlensOptions {
 interface NormalizedOptions {
   apiKey: string;
   endpoint: string;
+  configEndpoint: string;
+  configStreamEndpoint: string;
+  configReconnectDelayMs: number;
   batchSize: number;
   flushIntervalMs: number;
   maxQueueSize: number;
@@ -56,6 +62,7 @@ interface NormalizedOptions {
 
 const DEFAULT_BATCH_SIZE = 50;
 const DEFAULT_FLUSH_INTERVAL_MS = 5_000;
+const DEFAULT_CONFIG_RECONNECT_DELAY_MS = 5_000;
 const DEFAULT_MAX_QUEUE_SIZE = 1_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 2_000;
 const DEFAULT_MAX_BODY_BYTES = 10_000;
@@ -73,6 +80,26 @@ export function reqlens(options: ReqlensOptions): RequestHandler {
   const config = normalizeOptions(options);
   const queue: ReqlensLog[] = [];
   let isFlushing = false;
+
+  const applyConfig = (sdkConfig: SdkConfigResponse | undefined): void => {
+    const slowRequestThresholdMs = sdkConfig?.capture?.slowRequestThresholdMs;
+
+    if (
+      typeof slowRequestThresholdMs === "number" &&
+      Number.isFinite(slowRequestThresholdMs) &&
+      slowRequestThresholdMs > 0
+    ) {
+      config.capture.slowRequestThresholdMs = Math.floor(slowRequestThresholdMs);
+    }
+  };
+
+  const syncConfig = async (): Promise<void> => {
+    try {
+      applyConfig(await fetchSdkConfig(config));
+    } catch (error) {
+      config.onError?.(error);
+    }
+  };
 
   const flush = async (): Promise<void> => {
     if (!config.enabled || isFlushing || queue.length === 0) {
@@ -97,6 +124,8 @@ export function reqlens(options: ReqlensOptions): RequestHandler {
   }, config.flushIntervalMs);
 
   interval.unref?.();
+  void syncConfig();
+  void streamConfig(config, applyConfig);
 
   return (req, res, next) => {
     if (!config.enabled) {
@@ -161,6 +190,13 @@ function normalizeOptions(options: ReqlensOptions): NormalizedOptions {
   return {
     apiKey: options.apiKey,
     endpoint: options.endpoint,
+    configEndpoint: options.configEndpoint ?? getDefaultConfigEndpoint(options.endpoint),
+    configStreamEndpoint:
+      options.configStreamEndpoint ?? getDefaultConfigStreamEndpoint(options.endpoint),
+    configReconnectDelayMs: positiveInt(
+      options.configReconnectDelayMs,
+      DEFAULT_CONFIG_RECONNECT_DELAY_MS
+    ),
     batchSize: positiveInt(options.batchSize, DEFAULT_BATCH_SIZE),
     flushIntervalMs: positiveInt(options.flushIntervalMs, DEFAULT_FLUSH_INTERVAL_MS),
     maxQueueSize: positiveInt(options.maxQueueSize, DEFAULT_MAX_QUEUE_SIZE),
@@ -232,6 +268,120 @@ async function sendBatch(config: NormalizedOptions, logs: ReqlensLog[]): Promise
   }
 }
 
+type SdkConfigResponse = {
+  capture?: {
+    slowRequestThresholdMs?: number;
+  };
+};
+
+async function fetchSdkConfig(
+  config: NormalizedOptions
+): Promise<SdkConfigResponse | undefined> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), config.requestTimeoutMs);
+
+  try {
+    const response = await fetch(config.configEndpoint, {
+      method: "GET",
+      headers: {
+        "x-reqlens-api-key": config.apiKey
+      },
+      signal: controller.signal
+    });
+
+    if (!response.ok) {
+      throw new Error(`Reqlens config sync failed with status ${response.status}.`);
+    }
+
+    return (await response.json()) as SdkConfigResponse;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function streamConfig(
+  config: NormalizedOptions,
+  applyConfig: (sdkConfig: SdkConfigResponse | undefined) => void
+): Promise<void> {
+  while (config.enabled) {
+    try {
+      const response = await fetch(config.configStreamEndpoint, {
+        method: "GET",
+        headers: {
+          accept: "text/event-stream",
+          "x-reqlens-api-key": config.apiKey
+        }
+      });
+
+      if (!response.ok) {
+        throw new Error(
+          `Reqlens config stream failed with status ${response.status}.`
+        );
+      }
+
+      if (!response.body) {
+        throw new Error("Reqlens config stream response had no body.");
+      }
+
+      await readConfigStream(response.body, applyConfig);
+    } catch (error) {
+      config.onError?.(error);
+      await delay(config.configReconnectDelayMs);
+    }
+  }
+}
+
+async function readConfigStream(
+  body: ReadableStream<Uint8Array>,
+  applyConfig: (sdkConfig: SdkConfigResponse | undefined) => void
+): Promise<void> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+
+    if (done) {
+      return;
+    }
+
+    buffer += decoder.decode(value, { stream: true });
+    const messages = buffer.split("\n\n");
+    buffer = messages.pop() ?? "";
+
+    for (const message of messages) {
+      const config = parseConfigEvent(message);
+
+      if (config) {
+        applyConfig(config);
+      }
+    }
+  }
+}
+
+function parseConfigEvent(message: string): SdkConfigResponse | undefined {
+  const data = message
+    .split("\n")
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => line.slice("data:".length).trimStart())
+    .join("\n");
+
+  if (!data) {
+    return undefined;
+  }
+
+  try {
+    return JSON.parse(data) as SdkConfigResponse;
+  } catch {
+    return undefined;
+  }
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function getRoutePath(req: Request): string {
   const baseUrl = req.baseUrl ?? "";
   const routePath = getExpressRoutePath(req);
@@ -270,6 +420,30 @@ function joinPaths(baseUrl: string, routePath: string): string {
 
 function stripQuery(path: string): string {
   return path.split("?")[0] || "/";
+}
+
+function getDefaultConfigEndpoint(endpoint: string): string {
+  try {
+    const url = new URL(endpoint);
+    url.pathname = "/sdk/config";
+    url.search = "";
+    url.hash = "";
+    return url.toString();
+  } catch {
+    return endpoint.replace(/\/ingest\/?$/, "/sdk/config");
+  }
+}
+
+function getDefaultConfigStreamEndpoint(endpoint: string): string {
+  try {
+    const url = new URL(endpoint);
+    url.pathname = "/sdk/config/stream";
+    url.search = "";
+    url.hash = "";
+    return url.toString();
+  } catch {
+    return endpoint.replace(/\/ingest\/?$/, "/sdk/config/stream");
+  }
 }
 
 function shouldCapture(mode: ReqlensBodyCaptureMode, problem: boolean): boolean {
