@@ -21,7 +21,7 @@ export interface ReqlensLog {
 }
 
 export type ReqlensBodyCaptureMode = "always" | "errors-only" | "off";
-export type ReqlensLogLevel = "info" | "silent";
+export type ReqlensLogLevel = "debug" | "info" | "silent";
 
 export interface ReqlensCaptureOptions {
   requestBody?: ReqlensBodyCaptureMode;
@@ -34,6 +34,7 @@ export interface ReqlensCaptureOptions {
 export interface ReqlensOptions {
   apiKey: string;
   endpoint: string;
+  dashboardUrl?: string;
   configEndpoint?: string;
   configStreamEndpoint?: string;
   configReconnectDelayMs?: number;
@@ -50,6 +51,7 @@ export interface ReqlensOptions {
 interface NormalizedOptions {
   apiKey: string;
   endpoint: string;
+  dashboardUrl?: string;
   configEndpoint: string;
   configStreamEndpoint: string;
   configReconnectDelayMs: number;
@@ -70,6 +72,7 @@ const DEFAULT_MAX_QUEUE_SIZE = 1_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 2_000;
 const DEFAULT_MAX_BODY_BYTES = 10_000;
 const DEFAULT_SLOW_REQUEST_THRESHOLD_MS = 750;
+const DEFAULT_DASHBOARD_URL = "http://localhost:3000/dashboard";
 const DEFAULT_REDACT_KEYS = [
   "authorization",
   "card",
@@ -83,6 +86,8 @@ export function reqlens(options: ReqlensOptions): RequestHandler {
   const config = normalizeOptions(options);
   const queue: ReqlensLog[] = [];
   let isFlushing = false;
+  let hasLoggedConfigWait = false;
+  let lastLoggedSlowRequestThresholdMs: number | null = null;
 
   const applyConfig = (sdkConfig: SdkConfigResponse | undefined): void => {
     const slowRequestThresholdMs = sdkConfig?.capture?.slowRequestThresholdMs;
@@ -93,10 +98,14 @@ export function reqlens(options: ReqlensOptions): RequestHandler {
       slowRequestThresholdMs > 0
     ) {
       config.capture.slowRequestThresholdMs = Math.floor(slowRequestThresholdMs);
-      logInfo(
-        config,
-        `Config loaded. Slow payload capture threshold: ${config.capture.slowRequestThresholdMs} ms.`
-      );
+
+      if (lastLoggedSlowRequestThresholdMs !== config.capture.slowRequestThresholdMs) {
+        lastLoggedSlowRequestThresholdMs = config.capture.slowRequestThresholdMs;
+        logInfo(
+          config,
+          `Config loaded. Slow payload capture threshold: ${config.capture.slowRequestThresholdMs} ms.`
+        );
+      }
     }
   };
 
@@ -104,7 +113,14 @@ export function reqlens(options: ReqlensOptions): RequestHandler {
     try {
       applyConfig(await fetchSdkConfig(config));
     } catch (error) {
-      config.onError?.(error);
+      if (!hasLoggedConfigWait) {
+        logInfo(
+          config,
+          `Waiting for Reqlens API at ${getOriginLabel(config.configEndpoint)}.`
+        );
+        hasLoggedConfigWait = true;
+      }
+      logDebug(config, error);
     }
   };
 
@@ -120,6 +136,8 @@ export function reqlens(options: ReqlensOptions): RequestHandler {
       await sendBatch(config, batch);
     } catch (error) {
       requeueWithinLimit(queue, batch, config.maxQueueSize);
+      logInfo(config, `Could not send logs yet. Retrying next flush.`);
+      logDebug(config, error);
       config.onError?.(error);
     } finally {
       isFlushing = false;
@@ -133,7 +151,12 @@ export function reqlens(options: ReqlensOptions): RequestHandler {
   interval.unref?.();
   void syncConfig();
   void streamConfig(config, applyConfig);
-  logInfo(config, "Middleware started. Request logs will appear in the Reqlens dashboard.");
+  logInfo(
+    config,
+    `Middleware started. Request logs will appear in the Reqlens dashboard${
+      config.dashboardUrl ? `: ${config.dashboardUrl}` : "."
+    }`
+  );
 
   return (req, res, next) => {
     if (!config.enabled) {
@@ -198,6 +221,7 @@ function normalizeOptions(options: ReqlensOptions): NormalizedOptions {
   return {
     apiKey: options.apiKey,
     endpoint: options.endpoint,
+    dashboardUrl: options.dashboardUrl ?? DEFAULT_DASHBOARD_URL,
     configEndpoint: options.configEndpoint ?? getDefaultConfigEndpoint(options.endpoint),
     configStreamEndpoint:
       options.configStreamEndpoint ?? getDefaultConfigStreamEndpoint(options.endpoint),
@@ -312,6 +336,8 @@ async function streamConfig(
   config: NormalizedOptions,
   applyConfig: (sdkConfig: SdkConfigResponse | undefined) => void
 ): Promise<void> {
+  let isConfigStreamConnected = false;
+
   while (config.enabled) {
     try {
       const response = await fetch(config.configStreamEndpoint, {
@@ -332,10 +358,19 @@ async function streamConfig(
         throw new Error("Reqlens config stream response had no body.");
       }
 
-      logInfo(config, "Connected to Reqlens config stream.");
+      if (!isConfigStreamConnected) {
+        logInfo(config, "Connected. Live project settings are synced.");
+        isConfigStreamConnected = true;
+      }
       await readConfigStream(response.body, applyConfig);
     } catch (error) {
-      config.onError?.(error);
+      if (isConfigStreamConnected) {
+        logInfo(config, "Settings stream disconnected. Reconnecting...");
+        isConfigStreamConnected = false;
+      } else if (!isConnectionRefusedError(error)) {
+        logInfo(config, "Settings stream unavailable. Retrying...");
+      }
+      logDebug(config, error);
       await delay(config.configReconnectDelayMs);
     }
   }
@@ -535,5 +570,31 @@ function logInfo(config: NormalizedOptions, message: string): void {
     return;
   }
 
-  console.info(`[reqlens] ${message}`);
+  console.info(`${purple("[reqlens]")} ${message}`);
+}
+
+function logDebug(config: NormalizedOptions, error: unknown): void {
+  if (config.logLevel !== "debug") {
+    return;
+  }
+
+  console.warn(`${purple("[reqlens:debug]")}`, error);
+}
+
+function purple(value: string): string {
+  return `\u001b[35m${value}\u001b[0m`;
+}
+
+function getOriginLabel(endpoint: string): string {
+  try {
+    return new URL(endpoint).origin;
+  } catch {
+    return endpoint;
+  }
+}
+
+function isConnectionRefusedError(error: unknown): boolean {
+  return JSON.stringify(error, Object.getOwnPropertyNames(error)).includes(
+    "ECONNREFUSED"
+  );
 }
