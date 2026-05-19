@@ -15,7 +15,19 @@ export interface ReqlensLog {
   path: string;
   statusCode: number;
   durationMs: number;
+  requestBody?: unknown;
+  responseBody?: unknown;
   timestamp: string;
+}
+
+export type ReqlensBodyCaptureMode = "always" | "errors-only" | "off";
+
+export interface ReqlensCaptureOptions {
+  requestBody?: ReqlensBodyCaptureMode;
+  responseBody?: ReqlensBodyCaptureMode;
+  slowRequestThresholdMs?: number;
+  maxBodyBytes?: number;
+  redactKeys?: string[];
 }
 
 export interface ReqlensOptions {
@@ -26,6 +38,7 @@ export interface ReqlensOptions {
   maxQueueSize?: number;
   requestTimeoutMs?: number;
   enabled?: boolean;
+  capture?: ReqlensCaptureOptions;
   onError?: (error: unknown) => void;
 }
 
@@ -37,6 +50,7 @@ interface NormalizedOptions {
   maxQueueSize: number;
   requestTimeoutMs: number;
   enabled: boolean;
+  capture: Required<ReqlensCaptureOptions>;
   onError?: (error: unknown) => void;
 }
 
@@ -44,6 +58,16 @@ const DEFAULT_BATCH_SIZE = 50;
 const DEFAULT_FLUSH_INTERVAL_MS = 5_000;
 const DEFAULT_MAX_QUEUE_SIZE = 1_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 2_000;
+const DEFAULT_MAX_BODY_BYTES = 10_000;
+const DEFAULT_SLOW_REQUEST_THRESHOLD_MS = 750;
+const DEFAULT_REDACT_KEYS = [
+  "authorization",
+  "card",
+  "cookie",
+  "password",
+  "secret",
+  "token"
+];
 
 export function reqlens(options: ReqlensOptions): RequestHandler {
   const config = normalizeOptions(options);
@@ -81,15 +105,38 @@ export function reqlens(options: ReqlensOptions): RequestHandler {
     }
 
     const startedAt = process.hrtime.bigint();
+    let responseBody: unknown;
+    const originalJson = res.json.bind(res);
+    const originalSend = res.send.bind(res);
+
+    res.json = ((body: unknown) => {
+      responseBody = body;
+      return originalJson(body);
+    }) as typeof res.json;
+
+    res.send = ((body: unknown) => {
+      responseBody ??= body;
+      return originalSend(body as Parameters<typeof res.send>[0]);
+    }) as typeof res.send;
 
     res.once("finish", () => {
       const durationMs = Number(process.hrtime.bigint() - startedAt) / 1_000_000;
+      const roundedDurationMs = Math.round(durationMs);
+      const problem =
+        res.statusCode >= 400 ||
+        roundedDurationMs >= config.capture.slowRequestThresholdMs;
 
       enqueue(queue, config.maxQueueSize, {
         method: req.method,
         path: getRoutePath(req),
         statusCode: res.statusCode,
-        durationMs: Math.round(durationMs),
+        durationMs: roundedDurationMs,
+        requestBody: shouldCapture(config.capture.requestBody, problem)
+          ? snapshotPayload(req.body, config.capture)
+          : undefined,
+        responseBody: shouldCapture(config.capture.responseBody, problem)
+          ? snapshotPayload(responseBody, config.capture)
+          : undefined,
         timestamp: new Date().toISOString()
       });
 
@@ -119,6 +166,19 @@ function normalizeOptions(options: ReqlensOptions): NormalizedOptions {
     maxQueueSize: positiveInt(options.maxQueueSize, DEFAULT_MAX_QUEUE_SIZE),
     requestTimeoutMs: positiveInt(options.requestTimeoutMs, DEFAULT_REQUEST_TIMEOUT_MS),
     enabled: options.enabled ?? true,
+    capture: {
+      maxBodyBytes: positiveInt(
+        options.capture?.maxBodyBytes,
+        DEFAULT_MAX_BODY_BYTES
+      ),
+      redactKeys: options.capture?.redactKeys ?? DEFAULT_REDACT_KEYS,
+      requestBody: options.capture?.requestBody ?? "errors-only",
+      responseBody: options.capture?.responseBody ?? "errors-only",
+      slowRequestThresholdMs: positiveInt(
+        options.capture?.slowRequestThresholdMs,
+        DEFAULT_SLOW_REQUEST_THRESHOLD_MS
+      )
+    },
     onError: options.onError
   };
 }
@@ -210,4 +270,78 @@ function joinPaths(baseUrl: string, routePath: string): string {
 
 function stripQuery(path: string): string {
   return path.split("?")[0] || "/";
+}
+
+function shouldCapture(mode: ReqlensBodyCaptureMode, problem: boolean): boolean {
+  return mode === "always" || (mode === "errors-only" && problem);
+}
+
+function snapshotPayload(
+  value: unknown,
+  capture: Required<ReqlensCaptureOptions>
+): unknown {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  const redacted = redactPayload(value, new Set(capture.redactKeys.map(normalizeKey)));
+  const json = safeStringify(redacted);
+
+  if (json === undefined) {
+    return "[unserializable]";
+  }
+
+  if (Buffer.byteLength(json, "utf8") > capture.maxBodyBytes) {
+    return {
+      truncated: true,
+      preview: json.slice(0, capture.maxBodyBytes)
+    };
+  }
+
+  return JSON.parse(json) as unknown;
+}
+
+function redactPayload(value: unknown, redactKeys: Set<string>): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => redactPayload(item, redactKeys));
+  }
+
+  if (!isPlainObject(value)) {
+    return value;
+  }
+
+  return Object.fromEntries(
+    Object.entries(value).map(([key, nestedValue]) => [
+      key,
+      shouldRedactKey(key, redactKeys) ? "[redacted]" : redactPayload(nestedValue, redactKeys)
+    ])
+  );
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function shouldRedactKey(key: string, redactKeys: Set<string>): boolean {
+  const normalized = normalizeKey(key);
+
+  for (const redactKey of redactKeys) {
+    if (normalized.includes(redactKey)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function normalizeKey(key: string): string {
+  return key.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function safeStringify(value: unknown): string | undefined {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return undefined;
+  }
 }
